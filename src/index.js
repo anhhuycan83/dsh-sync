@@ -482,6 +482,7 @@ function gitAuthEnv(eff) {
   if (!eff || !eff.token) return undefined
   return {
     GIT_ASKPASS: askpassPath(), DSH_SYNC_TOKEN: String(eff.token), GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_PARAMETERS: "'credential.helper='",
     // GitHub HTTPS 不接受任意用户名（要 x-access-token），GitLab/其它 oauth2 即可
     DSH_SYNC_USER: gitUsernameForProvider(eff.repoUrl),
   }
@@ -970,7 +971,25 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   try { await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `sync ${instanceId} ${new Date().toISOString()}`], repoDir); commitOk = true } catch { /* nothing to commit */ }
   if (!commitOk) { await restoreBaseline(); return { pushed: false, nothingToCommit: true } }
 
-  // 5. push the branch (token in URL, not in config)
+  // 5. Push & merge:
+  const parsed = parseRepoUrl(eff.repoUrl)
+  if (!parsed) {
+    // GitHub/GitLab/自建 git (không qua PR): Đẩy trực tiếp vào nhánh mục tiêu (main) và tự động merge
+    try {
+      await gitExec(binary, ['push', remote, `HEAD:${eff.branch}`], repoDir, authEnv)
+    } catch (pushErr) {
+      // Nếu remote có commit mới, fetch và merge rồi đẩy lại
+      await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
+      await gitExec(binary, ['merge', '--no-edit', 'FETCH_HEAD'], repoDir).catch(() => {})
+      await gitExec(binary, ['push', remote, `HEAD:${eff.branch}`], repoDir, authEnv)
+    }
+    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+    state.lastPushedBranch = eff.branch
+    advancedToMain = true
+    return { pushed: true, branch: eff.branch, settingsPreserved }
+  }
+
+  // Đối với GitCode/Gitee: đẩy nhánh sync tạm và tạo PR qua REST API
   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
 
   // 6. create PR + mergeable check
@@ -978,18 +997,6 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   //    停在 sync 分支上，下一轮 fetch/reset 落空时 lastSyncedCommit 会被记成分支 tip，
   //    与远端 main 分叉 → 全库误判 bothModified 挂账（真机实证）
   try {
-    const parsed = parseRepoUrl(eff.repoUrl)
-    if (!parsed) {
-      // 无 PR REST 面的远端（GitHub/GitLab/本地测试/自建 git）：只推分支；
-      // PR 创建/合并跳过。推进影子基线到 main，作为下一轮 pull 的基线。
-      await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
-      await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
-      await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
-      state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-      state.lastPushedBranch = branch
-      advancedToMain = true
-      return { pushed: true, prSkipped: true, branch, settingsPreserved }
-    }
     // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
     const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
     const prRes = await createPullRequest(parsed.provider, eff.token, parsed.owner, parsed.repo, prBody)
@@ -2197,6 +2204,187 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, onFinish }) {
   return job
 }
 
+function scanZstdFrames(buffer) {
+  const ZSTD_MAGIC = 4247762216;
+  const frames = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const start = offset;
+    if (buffer.length - offset < 4) break;
+    if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) break;
+    offset += 4;
+    const descriptor = buffer.readUInt8(offset++);
+    const contentSizeFlag = descriptor >>> 6;
+    const singleSegment = (descriptor & 32) !== 0;
+    const checksum = (descriptor & 4) !== 0;
+    const dictionaryFlag = descriptor & 3;
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag;
+    const contentSizeBytes = contentSizeFlag === 0 ? singleSegment ? 1 : 0 : 1 << contentSizeFlag;
+    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes;
+    offset += remainingHeaderBytes;
+    for (;;) {
+      const blockHeader = buffer.readUIntLE(offset, 3);
+      offset += 3;
+      const lastBlock = (blockHeader & 1) !== 0;
+      const blockType = blockHeader >>> 1 & 3;
+      const blockSize = blockHeader >>> 3;
+      const payloadBytes = blockType === 1 ? 1 : blockSize;
+      offset += payloadBytes;
+      if (lastBlock) break;
+    }
+    if (checksum) offset += 4;
+    frames.push({ start, end: offset });
+  }
+  return frames;
+}
+
+async function rebuildSessionProjCache(dh) {
+  try {
+    const zlib = require('node:zlib');
+    if (!zlib.zstdDecompressSync) return;
+    const path = require('node:path');
+    const sessionsRoot = join(dh, 'sessions');
+    const projCacheDir = join(dh, 'storages', 'session_projcache', 'sessions');
+    const wsJsonPath = join(dh, 'storages', 'workspace.json');
+    if (!fsSync.existsSync(sessionsRoot)) return;
+    fsSync.mkdirSync(projCacheDir, { recursive: true });
+
+    let wsData = null;
+    let wsModified = false;
+    if (fsSync.existsSync(wsJsonPath)) {
+      try {
+        wsData = JSON.parse(fsSync.readFileSync(wsJsonPath, 'utf8'));
+      } catch {}
+    }
+
+    const wsDirs = fsSync.readdirSync(sessionsRoot);
+    for (const ws of wsDirs) {
+      const wsPath = join(sessionsRoot, ws);
+      try { if (!fsSync.statSync(wsPath).isDirectory()) continue; } catch { continue; }
+      const sDirs = fsSync.readdirSync(wsPath);
+      for (const s of sDirs) {
+        const outPath = join(projCacheDir, `${s}.json`);
+        const sPath = join(wsPath, s);
+        const zstdPath = join(sPath, 'session.v4.jsonl.zstd');
+        if (!fsSync.existsSync(zstdPath)) continue;
+
+        let header = null;
+        let title = null;
+        let titleSeq = 0;
+        let maxSeq = 0;
+
+        if (!fsSync.existsSync(outPath)) {
+          const buf = fsSync.readFileSync(zstdPath);
+          const frames = scanZstdFrames(buf);
+          if (frames.length > 0) {
+            for (const f of frames) {
+              const decomp = zlib.zstdDecompressSync(buf.subarray(f.start, f.end));
+              const lines = decomp.toString('utf8').split('\n').filter(Boolean);
+              for (const line of lines) {
+                try {
+                  const ev = JSON.parse(line);
+                  if (ev.seq !== undefined && ev.seq > maxSeq) maxSeq = ev.seq;
+                  if (ev.type === 'session' && !header) header = ev;
+                  else if (ev.type === 'session/title') { title = ev.data.title; titleSeq = ev.seq; }
+                  else if (ev.type === 'user/message' && !title) {
+                    if (ev.data && ev.data.content) {
+                      const text = ev.data.content.filter(b => b.type === 'text').map(b => b.text).join(' ');
+                      if (text && text.trim()) { title = text.trim().slice(0, 50); titleSeq = ev.seq; }
+                    }
+                  }
+                } catch {}
+              }
+            }
+          }
+
+          if (header) {
+            const finalTitle = title || 'New Session';
+            const record = {
+              version: 7,
+              record: {
+                identity: {
+                  formatVersion: header.version || 4,
+                  createdAt: header.createdAt,
+                  cwd: header.cwd,
+                  isSeeded: header.isSeeded || false,
+                  inheritedEventCount: 0
+                },
+                rows: {
+                  title: { ver: 1, seq: titleSeq || maxSeq, val: finalTitle },
+                  workingDirectory: { ver: 1, seq: 0, val: header.cwd }
+                }
+              }
+            };
+            fsSync.writeFileSync(outPath, JSON.stringify(record, null, 2), 'utf8');
+          }
+        } else {
+          try {
+            const rec = JSON.parse(fsSync.readFileSync(outPath, 'utf8'));
+            if (rec && rec.record && rec.record.identity) {
+              header = rec.record.identity;
+            }
+          } catch {}
+        }
+
+        // 1. Tự động tạo thư mục trên máy nếu chưa tồn tại
+        if (header && header.cwd) {
+          try {
+            if (!fsSync.existsSync(header.cwd)) {
+              fsSync.mkdirSync(header.cwd, { recursive: true });
+            }
+          } catch {}
+
+          // 2. Tự động liên kết vào workspace.json để hiển thị trên DSH Web
+          if (wsData && wsData.tables && wsData.tables.workspaces) {
+            const tables = wsData.tables.workspaces;
+            const globalWs = wsData.global || {};
+            const isDefaultWs = /default-workspace$/i.test(header.cwd);
+
+            let targetWs = null;
+            if (isDefaultWs && globalWs.defaultWorkspaceId && tables[globalWs.defaultWorkspaceId]) {
+              targetWs = tables[globalWs.defaultWorkspaceId];
+            } else {
+              const baseName = path.basename(header.cwd).toLowerCase();
+              for (const w of Object.values(tables)) {
+                if (w.path === header.cwd || (baseName && path.basename(w.path).toLowerCase() === baseName)) {
+                  targetWs = w;
+                  break;
+                }
+              }
+            }
+
+            if (targetWs) {
+              targetWs.sessionIds = targetWs.sessionIds || [];
+              if (!targetWs.sessionIds.includes(s)) {
+                targetWs.sessionIds.push(s);
+                wsModified = true;
+              }
+            } else {
+              const newWsId = randomUUID();
+              const wsTitle = path.basename(header.cwd) || 'workspace';
+              tables[newWsId] = {
+                path: header.cwd,
+                title: wsTitle,
+                sessionIds: [s],
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+              };
+              if (globalWs.workspaceIds) {
+                globalWs.workspaceIds.push(newWsId);
+              }
+              wsModified = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (wsModified && wsData) {
+      fsSync.writeFileSync(wsJsonPath, JSON.stringify(wsData, null, 2), 'utf8');
+    }
+  } catch {}
+}
+
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
@@ -2263,6 +2451,7 @@ module.exports = {
 
     // askpass 助手先于任何远端 git 命令落盘（GIT_ASKPASS env 注入的前提）
     writeAskpass().catch(e => ctx.logger.warn(`dsh-sync: askpass 初始化失败: ${e && e.message}`))
+    rebuildSessionProjCache(dh).catch(() => {})
 
     // ── 0.1.7 settings 接线 ──
     // 命名空间必须匹配 /^[a-z][a-z0-9-]*$/ —— 点号形式会被 settings 写入通道拒绝
@@ -2473,6 +2662,7 @@ module.exports = {
             }
           }
           state.lastSyncAt = new Date().toISOString()
+          rebuildSessionProjCache(dh).catch(() => {})
           // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）。
           // 与协议无关：git / webdav / local 任一启用都执行。
           if (eff.snapshotAuto !== false) {
