@@ -2385,6 +2385,28 @@ async function rebuildSessionProjCache(dh) {
   } catch {}
 }
 
+async function runAutoFixIfPresent(dh, logger) {
+  try {
+    const cp = require('node:child_process');
+    const skillPy = join(dh, 'skills', 'fix-dsh-agy', 'fix-dsh-agy.py');
+    const dshSkillPy = join(dh, 'skills', 'dsh', 'fix-dsh-agy', 'fix-dsh-agy.py');
+    const targetScript = fsSync.existsSync(skillPy) ? skillPy : fsSync.existsSync(dshSkillPy) ? dshSkillPy : null;
+    if (!targetScript) return;
+
+    // Chạy ngầm python fix-dsh-agy.py
+    const proc = cp.spawn('python', [targetScript], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    proc.unref();
+  } catch (e) {
+    if (logger && typeof logger.warn === 'function') {
+      logger.warn(`dsh-sync: auto fix-dsh-agy run: ${e && e.message}`);
+    }
+  }
+}
+
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
@@ -2663,6 +2685,7 @@ module.exports = {
           }
           state.lastSyncAt = new Date().toISOString()
           rebuildSessionProjCache(dh).catch(() => {})
+          runAutoFixIfPresent(dh, ctx.logger).catch(() => {})
           // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）。
           // 与协议无关：git / webdav / local 任一启用都执行。
           if (eff.snapshotAuto !== false) {
